@@ -1,9 +1,9 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import ArrowSvg from "../assets/arrow-right-thin-svgrepo-com.svg";
 import HowItWorks from "../assets/HowItWorks.svg";
 import FeatureCards from "./FeatureCards";
 import LanguageSwitcher from "./LanguageSwitcher";
-import Signup from "./Signup";
+import Signup from "./Signup"; // Done
 
 const Hero = () => {
   const [isSignupOpen, setIsSignupOpen] = useState(false);
@@ -69,12 +69,12 @@ const Hero = () => {
           {/* Main Heading */}
           <div className="space-y-2">
             <div className="flex items-center justify-center space-x-6 text-6xl font-bold text-gray-900">
-              <span>Instant</span>
+              <span>Clear</span>
               <LanguageSwitcher />
               <span>on</span>
             </div>
             <div className="text-6xl font-bold text-gray-900">
-              Policies, Rules & More!
+              Exams, Policies & More.
             </div>
           </div>
 
@@ -92,7 +92,7 @@ const Hero = () => {
               <input
                 type="text"
                 placeholder="Ask me anything..."
-                className="w-full px-6 py-4 text-gray-300 bg-gray-900 rounded-full border-none outline-none text-lg"
+                className="w-full px-6 py-4 text-gray-300 bg-gray-900 rounded-full border-none outline-none text-lg placeholder-white"
               />
               <div className="absolute right-3 top-1/2 transform -translate-y-1/2 flex space-x-2">
                 <button className="w-8 h-8 bg-gray-700 rounded-full flex items-center justify-center hover:bg-gray-600 transition-colors">

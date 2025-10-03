@@ -1,7 +1,9 @@
 # app.py - College Assistant RAG Backend (SIH + Gemini Flash + Google Voice, Full Version)
 
 from dotenv import load_dotenv
+
 load_dotenv()
+
 import json
 import os
 import time
@@ -9,39 +11,40 @@ import re
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-import tempfile
-import asyncio
 import warnings
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Body, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
 # LangChain (for RAG vectorstore)
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 # Google AI SDKs
 import google.generativeai as genai
 
-
 # PDF loaders
 try:
     import pdfplumber
+
     PDFPLUMBER_AVAILABLE = True
 except ImportError:
     PDFPLUMBER_AVAILABLE = False
 
 try:
     import PyPDF2
+
     PYPDF2_AVAILABLE = True
 except ImportError:
     PYPDF2_AVAILABLE = False
 
 try:
     from langchain_community.document_loaders import PyPDFLoader
+
     LANGCHAIN_PDF_AVAILABLE = True
 except ImportError:
     LANGCHAIN_PDF_AVAILABLE = False
@@ -65,25 +68,28 @@ executor = ThreadPoolExecutor(max_workers=4)
 # Gemini + Google Clients
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_EMBED_MODEL = "models/embedding-001"
 
 # -------------------- FASTAPI --------------------
 app = FastAPI(
     title="College Assistant RAG API (SIH + Gemini + Google Voice)",
-    version="8.0",
-    description="RAG backend with admin approval, student chat, streaming chat, and Google voice chat"
+    version="9.0",
+    description="RAG backend with admin approval, student chat, streaming chat, and Google voice chat",
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------- MODELS --------------------
 class ChatRequest(BaseModel):
@@ -91,23 +97,37 @@ class ChatRequest(BaseModel):
     department: Optional[str] = "General"
     k: Optional[int] = DEFAULT_K
 
+
 class ChatResponse(BaseModel):
     response: str
     department: str
     sources: List[Dict[str, Any]] = []
     elapsed_seconds: float
 
+
 class UploadResponse(BaseModel):
     message: str
     num_chunks: int
     stored_at: str
 
+
 # -------------------- GLOBALS --------------------
 _vectorstore = None
 upload_progress = {}
 _doc_approval_status: Dict[str, bool] = {}
+_chat_history: Dict[str, List[Dict[str, str]]] = {}
+_activity_log: List[Dict[str, str]] = []
+
 
 # -------------------- UTILS --------------------
+def log_activity(message: str):
+    _activity_log.insert(
+        0, {"message": message, "time": datetime.now(timezone.utc).strftime("%H:%M:%S")}
+    )
+    if len(_activity_log) > 20:
+        _activity_log.pop()
+
+
 def extract_text_from_pdf(pdf_path: Path) -> str:
     if PDFPLUMBER_AVAILABLE:
         with pdfplumber.open(pdf_path) as pdf:
@@ -120,13 +140,16 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         return "\n\n".join([p.extract_text() or "" for p in reader.pages])
     raise ImportError("No PDF loader available. Install pdfplumber or PyPDF2.")
 
+
 def preprocess_text(text: str) -> str:
     text = text.replace("&amp;", "&")
     text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
 
+
 def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=overlap,
@@ -136,11 +159,18 @@ def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[
     chunks = splitter.split_text(text)
     return [c.strip() for c in chunks if len(c.strip()) > 50]
 
-def embed_and_store_fast(chunks: List[str], metadata: Optional[List[Dict]] = None, batch_size: int = BATCH_SIZE):
+
+def embed_and_store_fast(
+    chunks: List[str],
+    metadata: Optional[List[Dict]] = None,
+    batch_size: int = BATCH_SIZE,
+):
     global _vectorstore
     if _vectorstore is None:
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
-        _vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
+        embeddings = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBED_MODEL)
+        _vectorstore = Chroma(
+            persist_directory=PERSIST_DIR, embedding_function=embeddings
+        )
 
     total = len(chunks)
     if total <= batch_size:
@@ -149,28 +179,29 @@ def embed_and_store_fast(chunks: List[str], metadata: Optional[List[Dict]] = Non
 
     futures = []
     for i in range(0, total, batch_size):
-        batch = chunks[i:i+batch_size]
-        meta_batch = metadata[i:i+batch_size] if metadata else None
-        futures.append(executor.submit(_vectorstore.add_texts, texts=batch, metadatas=meta_batch))
+        batch = chunks[i : i + batch_size]
+        meta_batch = metadata[i : i + batch_size] if metadata else None
+        futures.append(
+            executor.submit(_vectorstore.add_texts, texts=batch, metadatas=meta_batch)
+        )
 
     for f in futures:
         f.result()
     return _vectorstore
 
+
 def create_college_context_prompt(query: str, department: str) -> str:
     return f"""
     You are a knowledgeable and authoritative college assistant specializing in {department}.
-    Your job is to answer student questions about college rules, regulations, and policies.
+    Your job is to answer to the point student questions about college rules, regulations, and policies.
 
     IMPORTANT:
-    - Always give a clear, direct, and complete answer.
-    - Never respond with "tell me more" or "which library"—assume the context is THIS COLLEGE.
-    - Base your answers on the college’s policies and common academic practices.
+    - Always give a clear, direct, to the point, and complete answer.
+    - Assume the context is THIS COLLEGE.
     - Respond in the same language as the student's last question.
 
     Student Question: {query}
     """
-
 
 
 async def run_gemini(query: str) -> str:
@@ -178,35 +209,34 @@ async def run_gemini(query: str) -> str:
     resp = model.generate_content(query)
     return resp.text if resp and resp.text else "No response generated."
 
-# -------------------- GLOBALS --------------------
-_vectorstore = None
-upload_progress = {}
-_doc_approval_status: Dict[str, bool] = {}
-_chat_history: Dict[str, List[Dict[str, str]]] = {}
-  # user_id -> [{"role": "user/assistant", "content": "..."}]
-
 
 # -------------------- STARTUP --------------------
 @app.on_event("startup")
 def startup_event():
     global _vectorstore
     try:
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
-        _vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
-        print(f"✅ Vector DB loaded from {PERSIST_DIR}")
+        embeddings = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBED_MODEL)
+        _vectorstore = Chroma(
+            persist_directory=PERSIST_DIR, embedding_function=embeddings
+        )
+        print(f"✅ Vector DB loaded from {PERSIST_DIR} using Gemini embeddings")
     except Exception as e:
         print(f"❌ Failed to load vectorstore: {e}")
         _vectorstore = None
     print("🔥 Gemini + Google Voice backend ready!")
+
 
 # -------------------- HEALTH --------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "vectorstore_loaded": _vectorstore is not None}
 
+
 # -------------------- STUDENT CHAT --------------------
 @app.post("/chat", response_model=ChatResponse)
-async def chat_with_assistant(payload: ChatRequest = Body(...), user_id: str = "default"):
+async def chat_with_assistant(
+    payload: ChatRequest = Body(...), user_id: str = "default"
+):
     if _vectorstore is None:
         return ChatResponse(
             response="Vectorstore not initialized. Upload some PDFs first or call /test_retrieval.",
@@ -215,16 +245,15 @@ async def chat_with_assistant(payload: ChatRequest = Body(...), user_id: str = "
             elapsed_seconds=0.0,
         )
 
-    # init history for this user
     if user_id not in _chat_history:
         _chat_history[user_id] = []
 
-    # add current user query to history
     _chat_history[user_id].append({"role": "student", "content": payload.message})
-
-    # build conversation text
     conversation = "\n".join(
-        [f"{msg['role'].capitalize()}: {msg['content']}" for msg in _chat_history[user_id]]
+        [
+            f"{msg['role'].capitalize()}: {msg['content']}"
+            for msg in _chat_history[user_id]
+        ]
     )
 
     prompt = f"""
@@ -241,24 +270,22 @@ async def chat_with_assistant(payload: ChatRequest = Body(...), user_id: str = "
 
     start = time.time()
     result_text = await run_gemini(prompt)
-
-    # save assistant reply to history
     _chat_history[user_id].append({"role": "assistant", "content": result_text})
-
-    # keep history manageable (last 10 exchanges)
     _chat_history[user_id] = _chat_history[user_id][-20:]
 
-    # retrieve sources
     retriever = _vectorstore.as_retriever(search_kwargs={"k": payload.k or DEFAULT_K})
     docs = retriever.get_relevant_documents(payload.message)
-    approved = [d for d in docs if _doc_approval_status.get(d.metadata.get("source"), False)]
+    approved = [
+        d for d in docs if _doc_approval_status.get(d.metadata.get("source"), False)
+    ]
 
     elapsed = time.time() - start
+    log_activity(f"💬 Chat message: {payload.message[:30]}...")
     return ChatResponse(
         response=result_text,
         department=payload.department,
         sources=[{"source": d.metadata.get("source")} for d in approved],
-        elapsed_seconds=round(elapsed, 3)
+        elapsed_seconds=round(elapsed, 3),
     )
 
 
@@ -267,14 +294,20 @@ async def chat_stream(payload: ChatRequest = Body(...)):
     query = create_college_context_prompt(payload.message, payload.department)
 
     def event_stream():
-        retriever = _vectorstore.as_retriever(search_kwargs={"k": payload.k or DEFAULT_K})
+        retriever = _vectorstore.as_retriever(
+            search_kwargs={"k": payload.k or DEFAULT_K}
+        )
         docs = retriever.get_relevant_documents(payload.message)
         yield json.dumps({"type": "status", "message": "📚 searching documents"}) + "\n"
         for d in docs:
             preview = d.page_content[:120].replace("\n", " ")
-            yield json.dumps({"type": "doc", "source": d.metadata.get("source"), "preview": preview}) + "\n"
+            yield json.dumps(
+                {"type": "doc", "source": d.metadata.get("source"), "preview": preview}
+            ) + "\n"
 
-        yield json.dumps({"type": "status", "message": "🤔 Generating answer..."}) + "\n"
+        yield json.dumps(
+            {"type": "status", "message": "🤔 Generating answer..."}
+        ) + "\n"
 
         model = genai.GenerativeModel(GEMINI_MODEL)
         response = model.generate_content(query, stream=True)
@@ -285,6 +318,7 @@ async def chat_stream(payload: ChatRequest = Body(...)):
         yield json.dumps({"type": "done"}) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/json")
+
 
 # -------------------- ADMIN CHAT --------------------
 @app.post("/admin_chat", response_model=ChatResponse)
@@ -297,36 +331,28 @@ async def admin_chat(payload: ChatRequest = Body(...)):
     docs = retriever.get_relevant_documents(payload.message)
 
     elapsed = time.time() - start
+    log_activity(f"🛠 Admin chat: {payload.message[:30]}...")
     return ChatResponse(
         response=result_text,
         department=payload.department,
         sources=[{"source": d.metadata.get("source")} for d in docs],
-        elapsed_seconds=round(elapsed, 3)
+        elapsed_seconds=round(elapsed, 3),
     )
 
+
 # -------------------- ADMIN DOC CONTROL --------------------
-@app.post("/upload_pdf", response_model=UploadResponse)
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDFs supported")
+@app.post("/upload_pdf_async")
+async def upload_pdf_async(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+):
     content = await file.read()
-    temp_path = Path(TEMP_MD_DIR) / file.filename
-    temp_path.write_bytes(content)
+    upload_id = f"{file.filename}_{int(time.time())}"
+    upload_progress[upload_id] = {"status": "started", "progress": 0}
+    background_tasks.add_task(process_pdf_background, upload_id, content, file.filename)
 
-    text = extract_text_from_pdf(temp_path)
-    text = preprocess_text(text)
-    chunks = chunk_text(text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No valid text extracted")
+    log_activity(f"📤 Upload started: {file.filename}")
+    return {"upload_id": upload_id, "message": "Upload started"}
 
-    metadata = [{"source": file.filename, "chunk_id": i} for i in range(len(chunks))]
-    embed_and_store_fast(chunks, metadata)
-    _doc_approval_status[file.filename] = False
-
-    try: temp_path.unlink()
-    except: pass
-
-    return UploadResponse(message="Upload successful (awaiting approval)", num_chunks=len(chunks), stored_at=PERSIST_DIR)
 
 async def process_pdf_background(upload_id: str, file_content: bytes, filename: str):
     try:
@@ -345,30 +371,33 @@ async def process_pdf_background(upload_id: str, file_content: bytes, filename: 
         embed_and_store_fast(chunks, metadata)
         _doc_approval_status[filename] = False
 
-        upload_progress[upload_id] = {"status": "completed", "progress": 100, "num_chunks": len(chunks)}
-        try: temp_path.unlink()
-        except: pass
+        upload_progress[upload_id] = {
+            "status": "completed",
+            "progress": 100,
+            "num_chunks": len(chunks),
+        }
+        log_activity(f"✅ Upload completed: {filename}")
+        try:
+            temp_path.unlink()
+        except:
+            pass
     except Exception as e:
         upload_progress[upload_id] = {"status": "error", "error": str(e)}
 
-@app.post("/upload_pdf_async")
-async def upload_pdf_async(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    content = await file.read()
-    upload_id = f"{file.filename}_{int(time.time())}"
-    upload_progress[upload_id] = {"status": "started", "progress": 0}
-    background_tasks.add_task(process_pdf_background, upload_id, content, file.filename)
-    return {"upload_id": upload_id, "message": "Upload started"}
 
 @app.get("/upload_status/{upload_id}")
 def get_upload_status(upload_id: str):
     return upload_progress.get(upload_id, {"status": "not_found"})
+
 
 @app.post("/approve_doc/{filename}")
 def approve_doc(filename: str):
     if filename not in _doc_approval_status:
         raise HTTPException(status_code=404, detail="Doc not found")
     _doc_approval_status[filename] = True
+    log_activity(f"✔ Approved: {filename}")
     return {"message": f"{filename} approved and now available to students"}
+
 
 @app.delete("/delete_doc/{filename}")
 def delete_doc(filename: str):
@@ -376,9 +405,11 @@ def delete_doc(filename: str):
     try:
         _vectorstore._collection.delete(where={"source": filename})
         _doc_approval_status.pop(filename, None)
+        log_activity(f"🗑 Deleted: {filename}")
         return {"message": f"{filename} deleted from vectorstore"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
 
 @app.post("/test_retrieval")
 def test_retrieval(request: ChatRequest):
@@ -392,62 +423,24 @@ def test_retrieval(request: ChatRequest):
         "retrieved_docs": [
             {"source": d.metadata.get("source"), "preview": d.page_content[:200]}
             for d in docs
-        ]
+        ],
     }
+
+
 @app.get("/documents")
 def list_documents():
     docs = []
     for filename, approved in _doc_approval_status.items():
-        docs.append({
-            "name": filename,
-            "status": "verified" if approved else "processing"
-        })
+        docs.append(
+            {"name": filename, "status": "verified" if approved else "processing"}
+        )
     return docs
 
 
-# -------------------- VOICE CHAT --------------------
-# @app.post("/voice_chat")
-# async def voice_chat(file: UploadFile = File(...)):
-#     audio_path = Path(tempfile.mktemp(suffix=".wav"))
-#     audio_path.write_bytes(await file.read())
+@app.get("/recent_activities")
+def get_recent_activities():
+    return _activity_log
 
-#     # Speech-to-Text (Google)
-#     with open(audio_path, "rb") as f:
-#         audio = speech.RecognitionAudio(content=f.read())
-
-#     config = speech.RecognitionConfig(
-#         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-#         sample_rate_hertz=16000,
-#         language_code="pa-IN",  # can change dynamically
-#     )
-
-#     response = speech_client.recognize(config=config, audio=audio)
-#     query = " ".join([r.alternatives[0].transcript for r in response.results])
-
-#     if not query.strip():
-#         return {"error": "No speech recognized"}
-
-#     # RAG + Gemini
-#     result_text = await run_gemini(query)
-
-#     # TTS response (Google)
-#     synthesis_input = texttospeech.SynthesisInput(text=result_text)
-#     voice = texttospeech.VoiceSelectionParams(
-#         language_code="pa-IN", ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-#     )
-#     audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-
-#     tts_response = tts_client.synthesize_speech(
-#         input=synthesis_input, voice=voice, audio_config=audio_config
-#     )
-
-#     out_path = Path(tempfile.mktemp(suffix=".mp3"))
-#     out_path.write_bytes(tts_response.audio_content)
-
-#     try: audio_path.unlink()
-#     except: pass
-
-#     return FileResponse(out_path, media_type="audio/mpeg", filename="response.mp3")
 
 # -------------------- RUN --------------------
 if __name__ == "__main__":
