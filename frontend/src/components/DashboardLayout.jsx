@@ -1,4 +1,6 @@
 // src/components/DashboardLayout.jsx
+// Main layout component with sidebar and main content area for admin dashboard
+
 import { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -10,7 +12,6 @@ import {
   User,
   Upload,
   Download,
-  Settings,
   CheckCircle2,
   LogOut,
 } from "lucide-react";
@@ -21,22 +22,15 @@ const API_BASE = "http://127.0.0.1:8000";
 export default function DashboardLayout() {
   const [isExpanded, setIsExpanded] = useState(true);
   const [showProfileDropdown, setShowProfileDropdown] = useState(false);
+  const [recentActivities, setRecentActivities] = useState([]);
   const navigate = useNavigate();
 
+  // Sidebar items
   const sidebarItems = [
     { name: "Analytics", icon: BarChart3 },
     { name: "Test Chatbot", icon: MessageSquare },
     { name: "Policies", icon: FileText },
     { name: "Real chat", icon: MessageSquare },
-  ];
-
-  const recentActivities = [
-    { name: "Sample_doc.pdf uploaded", time: "2 mins ago" },
-    { name: "Sample_doc.pdf verified", time: "2 mins ago" },
-    { name: "Sample_doc.pdf uploaded", time: "2 mins ago" },
-    { name: "Sample_doc.pdf", time: "2 mins ago" },
-    { name: "Sample_doc.pdf", time: "2 mins ago" },
-    { name: "Sample_doc.pdf", time: "2 mins ago" },
   ];
 
   // Upload state
@@ -46,15 +40,19 @@ export default function DashboardLayout() {
   const [completed, setCompleted] = useState(false);
   const inputRef = useRef(null);
 
+  // Handle file select
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
     if (file && file.name.toLowerCase().endsWith(".pdf")) {
       setSelectedFile(file);
       setProgress(0);
       setCompleted(false);
+    } else {
+      alert("Only PDF files are allowed!");
     }
   };
 
+  // Handle file drop
   const handleDrop = (e) => {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
@@ -62,9 +60,12 @@ export default function DashboardLayout() {
       setSelectedFile(file);
       setProgress(0);
       setCompleted(false);
+    } else {
+      alert("Only PDF files are allowed!");
     }
   };
 
+  // Handle upload with polling
   const handleUpload = async () => {
     if (!selectedFile) return;
     setUploading(true);
@@ -74,69 +75,66 @@ export default function DashboardLayout() {
       const form = new FormData();
       form.append("file", selectedFile);
 
-      const token = localStorage.getItem("authToken");
-
       const res = await fetch(`${API_BASE}/upload_pdf_async`, {
         method: "POST",
-        headers: {
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
         body: form,
       });
+
+      if (!res.ok) {
+        throw new Error("Failed to start upload");
+      }
+
       const body = await res.json();
       const upload_id = body.upload_id;
 
-      // Poll for status
+      // Start polling for status
       const poll = setInterval(async () => {
-        const statusRes = await fetch(`${API_BASE}/upload_status/${upload_id}`, {
-          headers: {
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-        });
-        const status = await statusRes.json();
-
-        if (status.status === "processing") {
-          setProgress((prev) => Math.min(prev + 20, 80));
-        }
-        if (status.status === "completed") {
-          clearInterval(poll);
-          setProgress(100);
-          setUploading(false);
-          setCompleted(true);
-
-          // Approve document after upload
-          try {
-            await fetch(`${API_BASE}/approve_doc/${selectedFile.name}`, {
-              method: "POST",
-              headers: {
-                ...(token ? { Authorization: `Bearer ${token}` } : {}),
-              },
-            });
-          } catch (err) {
-            console.error("Approve failed:", err);
+        try {
+          const statusRes = await fetch(`${API_BASE}/upload_status/${upload_id}`);
+          if (!statusRes.ok) {
+            throw new Error("Status check failed");
           }
 
-          // Reset after green tick
-          setTimeout(() => {
-            setSelectedFile(null);
-            setCompleted(false);
+          const status = await statusRes.json();
+
+          if (status.status === "processing") {
+            setProgress((prev) => Math.min(prev + 15, 85));
+          }
+
+          if (status.status === "completed") {
+            clearInterval(poll);
+            setProgress(100);
+            setUploading(false);
+            setCompleted(true);
+
+            // Reset UI after 2s
+            setTimeout(() => {
+              setSelectedFile(null);
+              setCompleted(false);
+              setProgress(0);
+            }, 2000);
+          }
+
+          if (status.status === "error") {
+            clearInterval(poll);
+            setUploading(false);
             setProgress(0);
-          }, 2000);
-        }
-        if (status.status === "error") {
+            alert("Upload failed: " + (status.error || "Unknown error"));
+          }
+        } catch (pollErr) {
+          console.error("Polling failed:", pollErr);
           clearInterval(poll);
           setUploading(false);
-          setProgress(0);
-          alert("Upload failed: " + (status.error || "unknown error"));
         }
-      }, 1500);
+      }, 2000); // poll every 2s
     } catch (err) {
-      console.error(err);
+      console.error("Upload error:", err);
       setUploading(false);
+      alert("Upload failed: " + err.message);
     }
   };
 
-  // Logout function
+  // Logout
   const handleLogout = () => {
     localStorage.removeItem("authToken");
     localStorage.removeItem("userRole");
@@ -144,7 +142,27 @@ export default function DashboardLayout() {
     navigate("/");
   };
 
-  // Close dropdown when clicking outside
+  // Fetch logs for recent activity (top 5 only)
+  useEffect(() => {
+    const fetchLogs = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/logs`);
+        const data = await res.json();
+        if (data.logs) {
+          const latestFive = data.logs.slice(-5).reverse();
+          setRecentActivities(latestFive);
+        }
+      } catch (err) {
+        console.error("Failed to fetch logs:", err);
+      }
+    };
+
+    fetchLogs();
+    const interval = setInterval(fetchLogs, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Close dropdown on outside click
   useEffect(() => {
     const handleClickOutside = (event) => {
       if (!event.target.closest(".profile-dropdown")) {
@@ -157,8 +175,8 @@ export default function DashboardLayout() {
   }, []);
 
   return (
-    <div className="relative  bg-gray-100">
-      {/* Backdrop overlay when sidebar is expanded */}
+    <div className="relative bg-gray-100">
+      {/* Backdrop overlay */}
       {isExpanded && (
         <div
           className="fixed inset-0 bg-black bg-opacity-50 z-40 lg:hidden"
@@ -183,7 +201,6 @@ export default function DashboardLayout() {
           >
             MyApp
           </span>
-
           <button
             onClick={() => setIsExpanded(!isExpanded)}
             className={`pr-5 pt-2 pb-2 pl-2 cursor-pointer rounded-md hover:bg-gray-800 transition-all duration-300 ${
@@ -196,7 +213,7 @@ export default function DashboardLayout() {
           </button>
         </div>
 
-        {/* Sidebar Content */}
+        {/* Sidebar Items */}
         <nav className="mt-4 flex flex-col gap-2 flex-1">
           {sidebarItems.map((item) => {
             const IconComponent = item.icon;
@@ -208,7 +225,7 @@ export default function DashboardLayout() {
               } else if (item.name === "Policies") {
                 navigate("/policies");
               } else if (item.name === "Test Chatbot") {
-                navigate("/verification"); // ✅ NEW: go to VerificationInterface
+                navigate("/verification");
               }
             };
 
@@ -231,7 +248,7 @@ export default function DashboardLayout() {
           })}
         </nav>
 
-        {/* User Profile Section with Dropdown */}
+        {/* Profile Dropdown */}
         <div className="p-4 relative profile-dropdown">
           <div
             onClick={() => setShowProfileDropdown(!showProfileDropdown)}
@@ -266,6 +283,7 @@ export default function DashboardLayout() {
         </div>
       </div>
 
+      {/* Mobile Toggle */}
       <button
         onClick={() => setIsExpanded(!isExpanded)}
         className="fixed top-4 left-4 z-50 p-2 bg-black text-white rounded-md hover:bg-gray-800 transition-colors duration-200 lg:hidden"
@@ -288,9 +306,9 @@ export default function DashboardLayout() {
           </button>
         </div>
 
-        {/* Main Content Area */}
+        {/* Content */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Left Side - Upload Section */}
+          {/* Upload Section */}
           <div className="space-y-6">
             {/* Upload Area */}
             <div
@@ -364,32 +382,53 @@ export default function DashboardLayout() {
               <h3 className="text-lg font-semibold text-gray-900 mb-4">
                 Upload Guidelines & Best Practices
               </h3>
-
-              <div className="mb-4">
-                <h4 className="font-medium text-gray-900 mb-2">
-                  File Requirements
-                </h4>
-                <ul className="text-sm text-gray-700 space-y-1">
-                  <li>• Text-based documents work best</li>
-                  <li>• Avoid password-protected files</li>
-                </ul>
-              </div>
-
-              <div>
-                <h4 className="font-medium text-gray-900 mb-2">
-                  Processing Info
-                </h4>
-                <ul className="text-sm text-gray-700 space-y-1">
-                  <li>• Documents are automatically chunked</li>
-                  <li>• Processing time varies by document size</li>
-                  <li>• Files are available after embedding</li>
-                </ul>
-              </div>
+              <ul className="text-sm text-gray-700 space-y-1 mb-4">
+                <li>• Text-based documents work best</li>
+                <li>• Avoid password-protected files</li>
+              </ul>
+              <ul className="text-sm text-gray-700 space-y-1">
+                <li>• Documents are automatically chunked</li>
+                <li>• Processing time varies by document size</li>
+                <li>• Files are available after embedding</li>
+              </ul>
             </div>
           </div>
 
-          {/* Right Side - Stats and Activity */}
-          <Dashboard />
+          {/* Stats + Recent Activity */}
+          <div className="space-y-6">
+            <Dashboard />
+
+            {/* Recent Activity Logs */}
+            {/* <div className="bg-black text-green-400 font-mono p-4 rounded-lg shadow-inner">
+              <h3 className="text-lg font-semibold text-white mb-4">
+                Recent Activity
+              </h3>
+              <ul className="space-y-2 max-h-64 overflow-y-auto text-sm">
+                {recentActivities.length > 0 ? (
+                  recentActivities.map((log, idx) => {
+                    let dotColor = "bg-gray-400";
+                    if (log.includes("[INFO]")) dotColor = "bg-green-500";
+                    if (log.includes("[ERROR]")) dotColor = "bg-red-500";
+                    if (log.includes("[WARN]")) dotColor = "bg-yellow-500";
+
+                    return (
+                      <li
+                        key={idx}
+                        className="flex items-center gap-3 border-b border-gray-700 pb-2 last:border-none"
+                      >
+                        <span
+                          className={`w-2 h-2 rounded-full ${dotColor}`}
+                        ></span>
+                        <span className="text-gray-200">{log}</span>
+                      </li>
+                    );
+                  })
+                ) : (
+                  <li className="text-gray-500">No recent logs</li>
+                )}
+              </ul>
+            </div> */}
+          </div>
         </div>
       </main>
     </div>
